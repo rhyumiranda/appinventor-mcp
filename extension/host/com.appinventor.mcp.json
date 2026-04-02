@@ -1,0 +1,7 @@
+{
+  "name": "com.appinventor.mcp",
+  "description": "MIT App Inventor MCP Bridge Native Messaging Host",
+  "path": "",
+  "type": "stdio",
+  "allowed_origins": []
+}
