@@ -1,0 +1,38 @@
+{
+  "manifest_version": 3,
+  "name": "MIT App Inventor MCP Bridge",
+  "version": "0.1.0",
+  "description": "Exposes MIT App Inventor as an MCP server for AI agents",
+  "permissions": [
+    "nativeMessaging",
+    "activeTab",
+    "scripting",
+    "tabs",
+    "alarms",
+    "storage"
+  ],
+  "host_permissions": [
+    "*://*.appinventor.mit.edu/*",
+    "http://localhost:8765/*",
+    "ws://localhost:8765/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "*://*.appinventor.mit.edu/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["page-bridge.js"],
+      "matches": ["*://*.appinventor.mit.edu/*"]
+    }
+  ],
+  "icons": {}
+}

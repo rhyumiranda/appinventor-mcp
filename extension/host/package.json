@@ -1,0 +1,20 @@
+{
+  "name": "appinventor-mcp-host",
+  "version": "0.1.0",
+  "description": "Native messaging host for MIT App Inventor MCP Bridge",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "ws": "^8.20.0"
+  },
+  "devDependencies": {
+    "@vitest/coverage-v8": "^3.1.1",
+    "vitest": "^3.1.1"
+  }
+}
