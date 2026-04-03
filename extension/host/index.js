@@ -8,8 +8,8 @@ const WS_PORT = 8765;
 const stdout = process.stdout;
 const stderr = process.stderr;
 
-// Track connected extension
-let extensionSocket = null;
+// Track ALL connected sockets — broadcast to all, first response wins
+const connectedSockets = new Set();
 const pendingRequests = new Map();
 let requestCounter = 0;
 
@@ -21,12 +21,13 @@ wss.on('listening', () => {
 });
 
 wss.on('connection', (ws) => {
-  stderr.write('Chrome extension connected\n');
-  extensionSocket = ws;
+  stderr.write(`Chrome connection opened (total: ${connectedSockets.size + 1})\n`);
+  connectedSockets.add(ws);
 
   ws.on('message', (data) => {
     try {
       const msg = JSON.parse(data);
+      if (msg.type === 'ping') return; // ignore keepalive
       // Response from extension for a pending request
       const resolve = pendingRequests.get(msg.requestId);
       if (resolve) {
@@ -39,13 +40,8 @@ wss.on('connection', (ws) => {
   });
 
   ws.on('close', () => {
-    stderr.write('Chrome extension disconnected\n');
-    if (extensionSocket === ws) extensionSocket = null;
-    // Reject all pending requests
-    for (const [id, resolve] of pendingRequests) {
-      resolve({ success: false, error: 'Extension disconnected' });
-      pendingRequests.delete(id);
-    }
+    connectedSockets.delete(ws);
+    stderr.write(`Chrome connection closed (remaining: ${connectedSockets.size})\n`);
   });
 });
 
@@ -53,13 +49,15 @@ wss.on('error', (err) => {
   stderr.write(`WS server error: ${err.message}\n`);
 });
 
-// --- Tool executor: forwards to Chrome extension via WebSocket ---
+// --- Tool executor: broadcasts to ALL connections, first response wins ---
 async function toolExecutor(toolName, args) {
-  if (!extensionSocket || extensionSocket.readyState !== 1) {
+  const liveSockets = [...connectedSockets].filter(ws => ws.readyState === 1);
+  if (liveSockets.length === 0) {
     return { success: false, error: 'Chrome extension not connected. Open App Inventor in Chrome with the extension enabled.' };
   }
 
   const requestId = `req-${++requestCounter}`;
+  stderr.write(`Broadcasting ${toolName} to ${liveSockets.length} connection(s)\n`);
 
   return new Promise((resolve) => {
     const timeout = setTimeout(() => {
@@ -72,12 +70,16 @@ async function toolExecutor(toolName, args) {
       resolve(result);
     });
 
-    extensionSocket.send(JSON.stringify({
+    const payload = JSON.stringify({
       type: 'tool_call',
       requestId,
       tool: toolName,
       params: args
-    }));
+    });
+
+    for (const ws of liveSockets) {
+      try { ws.send(payload); } catch {}
+    }
   });
 }
 

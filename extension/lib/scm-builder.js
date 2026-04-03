@@ -4,26 +4,32 @@ const DEFAULT_FORM_VERSION = '31';
 
 // Default versions for common component types
 const COMPONENT_VERSIONS = {
-  Form: '31',
-  Button: '7',
-  Label: '5',
-  TextBox: '6',
-  VerticalArrangement: '4',
-  HorizontalArrangement: '4',
-  Image: '5',
-  ListView: '6',
-  Notifier: '6',
+  // UI
+  Form: '31', Button: '7', Label: '5', TextBox: '6', PasswordTextBox: '5',
+  CheckBox: '3', Switch: '2', Slider: '2', Spinner: '2', ListPicker: '9',
+  DatePicker: '4', TimePicker: '4', Image: '5', ListView: '6', WebViewer: '10',
+  // Layout
+  VerticalArrangement: '4', HorizontalArrangement: '4', TableArrangement: '2',
+  // Media
+  Camcorder: '2', Camera: '4', ImagePicker: '6', Player: '7', Sound: '4',
+  SpeechRecognizer: '3', TextToSpeech: '5', VideoPlayer: '7',
+  // Drawing & Animation
   Canvas: '14',
+  // Maps
+  Map: '7', Marker: '4', Circle: '2', LineString: '2', Polygon: '2', Rectangle: '2',
+  // Sensors
+  AccelerometerSensor: '5', LocationSensor: '4', OrientationSensor: '2',
+  BarcodeScannerComponent: '2', NearField: '2', Pedometer: '3', ProximitySensor: '2',
   Clock: '4',
-  TinyDB: '2',
-  Web: '7',
-  Spinner: '2',
-  CheckBox: '3',
-  DatePicker: '4',
-  TimePicker: '4',
-  Slider: '2',
-  Switch: '2',
-  PasswordTextBox: '5'
+  // Social
+  ContactPicker: '6', EmailPicker: '4', PhoneCall: '3', PhoneNumberPicker: '5',
+  Sharing: '2', Texting: '5', Twitter: '5',
+  // Storage
+  TinyDB: '2', File: '4', CloudDB: '2', FirebaseDB: '3', FusiontablesControl: '4',
+  // Connectivity
+  Web: '7', ActivityStarter: '7', BluetoothClient: '8', BluetoothServer: '5',
+  // Non-visible
+  Notifier: '6'
 };
 
 function getComponentVersion(type) {

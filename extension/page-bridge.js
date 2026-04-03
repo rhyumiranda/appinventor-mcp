@@ -288,18 +288,26 @@
 
     // Get or generate session UUID
     const sessionUuid = capturedSessionUuid || generateUuid();
-    // Get file path
-    const filePath = capturedFilePath || (function() {
-      const projectName = typeof BlocklyPanel_getProjectName === 'function' ? BlocklyPanel_getProjectName() : null;
-      if (!projectName) return null;
-      const bodyText = document.body.innerHTML;
-      const m = bodyText.match(/src\/appinventor\/(ai_[^/]+)\//);
-      if (m) return 'src/appinventor/' + m[1] + '/' + projectName + '/' + (params.screenName || 'Screen1') + '.scm';
-      return null;
-    })();
+    // Get file path — MUST respect screenName param, not just use cached path
+    const targetScreen = params.screenName || 'Screen1';
+    let filePath = capturedFilePath;
+    if (filePath) {
+      // Replace the screen name in the cached path to match the target screen
+      filePath = filePath.replace(/\/[^/]+\.scm$/, '/' + targetScreen + '.scm');
+    } else {
+      filePath = (function() {
+        const projectName = typeof BlocklyPanel_getProjectName === 'function' ? BlocklyPanel_getProjectName() : null;
+        if (!projectName) return null;
+        const bodyText = document.body.innerHTML;
+        const m = bodyText.match(/src\/appinventor\/(ai_[^/]+)\//);
+        if (m) return 'src/appinventor/' + m[1] + '/' + projectName + '/' + targetScreen + '.scm';
+        return null;
+      })();
+    }
     if (!filePath) {
       return { success: false, error: 'Could not determine file path' };
     }
+    console.log('[MCP Bridge] add_components target:', targetScreen, 'path:', filePath);
     // Get GWT hash (from body) and base36
     const gwtHash = capturedGwtHash || permHash;
     const base36 = capturedBase36 || (function() {
@@ -312,28 +320,23 @@
 
     // Build SCM and RPC body
     let rpcBody;
-    if (capturedScmJson && capturedRpcTemplate) {
-      // Template mode: merge into existing SCM
+    // Determine if captured SCM belongs to the same screen we're targeting
+    const capturedScreen = capturedFilePath ? capturedFilePath.replace(/.*\/([^/]+)\.scm$/, '$1') : null;
+    const sameScreen = capturedScreen === targetScreen;
+    console.log('[MCP Bridge] capturedScreen:', capturedScreen, 'targetScreen:', targetScreen, 'sameScreen:', sameScreen);
+
+    if (capturedScmJson && capturedRpcTemplate && sameScreen) {
+      // Template mode: REPLACE components in existing SCM (always clean slate)
       const scm = JSON.parse(JSON.stringify(capturedScmJson));
-      let maxUuid = 0;
-      function findMaxUuid(obj) {
-        const u = Math.abs(parseInt(obj.Uuid) || 0);
-        if (u > maxUuid) maxUuid = u;
-        if (obj.$Components) obj.$Components.forEach(findMaxUuid);
-      }
-      findMaxUuid(scm.Properties);
-      // If replaceAll, clear existing components and set screen properties
-      if (params.replaceAll) {
-        scm.Properties.$Components = [];
-        if (params.screenProperties) {
-          for (const [k, v] of Object.entries(params.screenProperties)) {
-            scm.Properties[k] = String(v);
-          }
-        }
-      }
-      if (!scm.Properties.$Components) scm.Properties.$Components = [];
-      scm.Properties.$Components.push(...buildComponentNodes(params.components, maxUuid + 1));
+      // Always clear existing components to avoid duplicates
+      // Use startUuid from params, or default based on screen name to avoid cross-screen conflicts
+      const startUuid = params.startUuid || (targetScreen === 'Screen1' ? 1 : 1000);
+      scm.Properties.$Components = buildComponentNodes(params.components, startUuid);
       rpcBody = capturedRpcTemplate.replace('___SCM_PLACEHOLDER___', JSON.stringify(scm));
+      // Fix file path in RPC body if targeting a different screen
+      if (capturedFilePath && capturedFilePath !== filePath) {
+        rpcBody = rpcBody.replace(capturedFilePath, filePath);
+      }
     } else {
       // From-scratch mode: build fresh SCM and RPC body
       const scm = {
@@ -341,14 +344,14 @@
         YaVersion: '233',
         Source: 'Form',
         Properties: {
-          $Name: params.screenName || 'Screen1',
+          $Name: targetScreen,
           $Type: 'Form',
           $Version: '31',
           ActionBar: 'True',
           AppName: typeof BlocklyPanel_getProjectName === 'function' ? BlocklyPanel_getProjectName() : 'App',
-          Title: params.screenName || 'Screen1',
+          Title: targetScreen,
           Uuid: '0',
-          $Components: buildComponentNodes(params.components, 1)
+          $Components: buildComponentNodes(params.components, startUuid || (targetScreen === 'Screen1' ? 1 : 1000))
         }
       };
       const scmContent = '#\\!\n$JSON\n' + JSON.stringify(scm) + '\n\\!#';
@@ -373,11 +376,12 @@
       console.log('[MCP Bridge] save2 response:', xhr.status, xhr.responseText.substring(0, 300));
 
       if (xhr.status === 200) {
-        location.reload();
+        // Don't auto-reload — it kicks to project list. User can manually switch screens to refresh.
         return {
           success: true,
           componentsAdded: collectNames(params.components),
-          reloadRequired: true
+          reloadRequired: false,
+          note: 'Switch screens and back to see changes, or refresh manually.'
         };
       } else {
         return { success: false, error: `save2 failed with status ${xhr.status}: ${xhr.responseText.substring(0, 200)}` };
@@ -407,13 +411,8 @@
 
       const xmlDom = Blockly.utils.xml.textToDom(xmlStr);
 
-      Blockly.Events.disable();
-      let newBlockIds;
-      try {
-        newBlockIds = Blockly.Xml.domToWorkspace(xmlDom, ws);
-      } finally {
-        Blockly.Events.enable();
-      }
+      // Don't disable events — App Inventor needs them to trigger auto-save
+      const newBlockIds = Blockly.Xml.domToWorkspace(xmlDom, ws);
 
       // Check for warnings on new blocks
       const warnings = [];
@@ -423,6 +422,13 @@
           warnings.push(block.warning.getText());
         }
       }
+
+      // Force App Inventor to save blocks by firing a synthetic change event
+      try {
+        if (typeof BlocklyPanel_blocklyWorkspaceChanged === 'function') {
+          BlocklyPanel_blocklyWorkspaceChanged(ws);
+        }
+      } catch(e) { /* best effort */ }
 
       return {
         success: true,
@@ -646,12 +652,32 @@
   // --- Helpers ---
 
   const COMPONENT_VERSIONS = {
-    Form: '31', Button: '7', Label: '5', TextBox: '6',
-    VerticalArrangement: '4', HorizontalArrangement: '4',
-    Image: '5', ListView: '6', Notifier: '6', Canvas: '14',
-    Clock: '4', TinyDB: '2', Web: '7', Spinner: '2',
-    CheckBox: '3', DatePicker: '4', TimePicker: '4',
-    Slider: '2', Switch: '2', PasswordTextBox: '5'
+    // UI
+    Form: '31', Button: '7', Label: '5', TextBox: '6', PasswordTextBox: '5',
+    CheckBox: '3', Switch: '2', Slider: '2', Spinner: '2', ListPicker: '9',
+    DatePicker: '4', TimePicker: '4', Image: '5', ListView: '6', WebViewer: '10',
+    // Layout
+    VerticalArrangement: '4', HorizontalArrangement: '4', TableArrangement: '2',
+    // Media
+    Camcorder: '2', Camera: '4', ImagePicker: '6', Player: '7', Sound: '4',
+    SpeechRecognizer: '3', TextToSpeech: '5', VideoPlayer: '7',
+    // Drawing & Animation
+    Canvas: '14',
+    // Maps
+    Map: '7', Marker: '4', Circle: '2', LineString: '2', Polygon: '2', Rectangle: '2',
+    // Sensors
+    AccelerometerSensor: '5', LocationSensor: '4', OrientationSensor: '2',
+    BarcodeScannerComponent: '2', NearField: '2', Pedometer: '3', ProximitySensor: '2',
+    Clock: '4',
+    // Social
+    ContactPicker: '6', EmailPicker: '4', PhoneCall: '3', PhoneNumberPicker: '5',
+    Sharing: '2', Texting: '5', Twitter: '5',
+    // Storage
+    TinyDB: '2', File: '4', CloudDB: '2', FirebaseDB: '3', FusiontablesControl: '4',
+    // Connectivity
+    Web: '7', ActivityStarter: '7', BluetoothClient: '8', BluetoothServer: '5',
+    // Non-visible
+    Notifier: '6'
   };
 
   function buildComponentNodes(specs, nextUuid) {
@@ -807,6 +833,17 @@
 
   // Request cached params from content script
   window.postMessage({ type: BRIDGE_PREFIX + 'cache-read' }, '*');
+
+  // Expose tool dispatch globally so background can call via executeScript
+  window.__mcpBridge = async function(tool, params) {
+    const handler = TOOL_HANDLERS[tool];
+    if (!handler) return { success: false, error: `Unknown tool: ${tool}` };
+    try {
+      return await handler(params || {});
+    } catch (err) {
+      return { success: false, error: `Tool error: ${err.message}` };
+    }
+  };
 
   console.log('[MCP Bridge] Page bridge loaded, tools ready');
 })();
