@@ -203,177 +203,21 @@
   async function handle_get_component_tree(params) {
     const screenName = params.screenName || 'Screen1';
 
-    // If we already have cached SCM for this screen, return it
-    if (capturedScmJson && capturedFilePath) {
-      const cachedScreen = capturedFilePath.replace(/.*\/([^/]+)\.scm$/, '$1');
-      if (cachedScreen === screenName) {
-        return { success: true, screen: screenName, tree: capturedScmJson };
-      }
+    // If we already have captured SCM, return it
+    if (capturedScmJson) {
+      return { success: true, screenName, tree: capturedScmJson };
     }
 
-    // Force a save to capture the current SCM
-    const got = await getCurrentScm();
-    if (!got || !capturedScmJson) {
-      return { success: false, error: 'Could not capture component tree. Make sure you are in the Designer view.' };
+    // Otherwise, trigger a save to capture the SCM
+    const captured = await getCurrentScm();
+    if (captured && capturedScmJson) {
+      return { success: true, screenName, tree: capturedScmJson };
     }
 
-    return { success: true, screen: screenName, tree: capturedScmJson };
-  }
-
-  // Recursively find a component by $Name in the SCM tree
-  function findComponentInTree(node, name) {
-    if (node.$Name === name) return node;
-    if (node.$Components) {
-      for (const child of node.$Components) {
-        const found = findComponentInTree(child, name);
-        if (found) return found;
-      }
-    }
-    return null;
-  }
-
-  // Recursively remove components by name from the SCM tree
-  function removeComponentsFromTree(node, names) {
-    if (node.$Components) {
-      node.$Components = node.$Components.filter(c => !names.includes(c.$Name));
-      for (const child of node.$Components) {
-        removeComponentsFromTree(child, names);
-      }
-    }
-  }
-
-  // Save the current SCM back via save2
-  function saveScm(scm) {
-    const permHash = extractGwtPermutation();
-    if (!permHash) return { success: false, error: 'Could not extract GWT permutation hash' };
-
-    const sessionUuid = capturedSessionUuid || generateUuid();
-    const gwtHash = capturedGwtHash || permHash;
-
-    if (!capturedRpcTemplate) {
-      // Build from scratch
-      const base36 = capturedBase36 || (function() {
-        const pid = typeof HTML5DragDrop_getOpenProjectId === 'function' ? HTML5DragDrop_getOpenProjectId() : null;
-        return pid ? parseInt(pid).toString(36).toUpperCase() : null;
-      })();
-      if (!base36 || !capturedFilePath) return { success: false, error: 'Missing session params. Try adding a component first.' };
-
-      const scmContent = '#\\!\n$JSON\n' + JSON.stringify(scm) + '\n\\!#';
-      const baseUrl = window.location.origin + '/ode/';
-      var rpcBody = '7|0|10|' + baseUrl + '|' + gwtHash +
-        '|com.google.appinventor.shared.rpc.project.ProjectService|save2|' +
-        'java.lang.String/2004016611|J|Z|' + sessionUuid + '|' +
-        capturedFilePath + '|' + scmContent +
-        '|1|2|3|4|5|5|6|5|7|5|8|' + base36 + '|9|0|10|';
-    } else {
-      var rpcBody = capturedRpcTemplate.replace('___SCM_PLACEHOLDER___', JSON.stringify(scm));
-    }
-
-    try {
-      const xhr = new XMLHttpRequest();
-      xhr.open('POST', window.location.origin + '/ode/projects', false);
-      xhr.setRequestHeader('Content-Type', 'text/x-gwt-rpc; charset=UTF-8');
-      xhr.setRequestHeader('X-GWT-Module-Base', window.location.origin + '/ode/');
-      if (permHash) xhr.setRequestHeader('X-GWT-Permutation', permHash);
-      xhr.send(rpcBody);
-
-      if (xhr.status === 200) {
-        // Update cached SCM
-        capturedScmJson = JSON.parse(JSON.stringify(scm));
-        return { success: true };
-      } else {
-        return { success: false, error: `save2 failed with status ${xhr.status}: ${xhr.responseText.substring(0, 200)}` };
-      }
-    } catch (err) {
-      return { success: false, error: `save2 error: ${err.message}` };
-    }
-  }
-
-  async function handle_update_component_properties(params) {
-    const { componentName, screenName } = params;
-    if (!componentName) return { success: false, error: 'componentName is required' };
-
-    // Ensure properties is an object (may arrive as JSON string from MCP)
-    let properties = params.properties;
-    if (typeof properties === 'string') {
-      try { properties = JSON.parse(properties); } catch(e) {
-        return { success: false, error: 'properties must be a JSON object' };
-      }
-    }
-    if (!properties || typeof properties !== 'object' || Object.keys(properties).length === 0) {
-      return { success: false, error: 'properties object is required' };
-    }
-
-    // Try direct GWT property setter first (instant, no save2 needed)
-    if (typeof BlocklyPanel_setComponentProperty === 'function') {
-      const screen = screenName || (typeof BlocklyPanel_getCurrentScreen === 'function' ? BlocklyPanel_getCurrentScreen() : 'Screen1');
-      let directSuccess = true;
-      for (const [key, value] of Object.entries(properties)) {
-        try {
-          BlocklyPanel_setComponentProperty(screen, componentName, key, String(value), key);
-        } catch(e) {
-          directSuccess = false;
-          break;
-        }
-      }
-      if (directSuccess) {
-        // Also update cached SCM if we have it
-        if (capturedScmJson) {
-          const comp = findComponentInTree(capturedScmJson.Properties, componentName);
-          if (comp) {
-            for (const [key, value] of Object.entries(properties)) {
-              comp[key] = String(value);
-            }
-          }
-        }
-        return { success: true, method: 'direct', note: 'Properties updated via BlocklyPanel. Changes are live.' };
-      }
-    }
-
-    // Fallback: SCM edit + save2
-    if (!capturedScmJson || !capturedRpcTemplate) {
-      const got = await getCurrentScm();
-      if (!got || !capturedScmJson) {
-        return { success: false, error: 'Could not capture current SCM.' };
-      }
-    }
-
-    const scm = JSON.parse(JSON.stringify(capturedScmJson));
-    const comp = findComponentInTree(scm.Properties, componentName);
-    if (!comp) return { success: false, error: `Component "${componentName}" not found in tree` };
-
-    for (const [key, value] of Object.entries(properties)) {
-      comp[key] = String(value);
-    }
-
-    const result = saveScm(scm);
-    if (result.success) {
-      result.method = 'save2';
-      result.note = 'Switch screens and back to see changes.';
-    }
-    return result;
-  }
-
-  async function handle_remove_components(params) {
-    const { componentNames, screenName } = params;
-    if (!componentNames || componentNames.length === 0) return { success: false, error: 'componentNames array is required' };
-
-    if (!capturedScmJson || !capturedRpcTemplate) {
-      const got = await getCurrentScm();
-      if (!got || !capturedScmJson) {
-        return { success: false, error: 'Could not capture current SCM.' };
-      }
-    }
-
-    const scm = JSON.parse(JSON.stringify(capturedScmJson));
-    removeComponentsFromTree(scm.Properties, componentNames);
-
-    const result = saveScm(scm);
-    if (result.success) {
-      result.componentsRemoved = componentNames;
-      result.note = 'Switch screens and back to see changes.';
-    }
-    return result;
+    return {
+      success: false,
+      error: 'Could not capture component tree. Make sure you are on the Designer view (not Blocks) and try again.'
+    };
   }
 
   // Generate a UUID v4
@@ -485,18 +329,32 @@
 
     if (capturedScmJson && capturedRpcTemplate && sameScreen) {
       const scm = JSON.parse(JSON.stringify(capturedScmJson));
-      // Find the max existing UUID to avoid conflicts when appending
-      const maxUuid = getMaxUuid(scm.Properties);
-      const startUuid = params.startUuid || (maxUuid + 1);
+      const mode = params.mode || 'merge';
 
-      if (params.replaceAll) {
-        // Replace mode: wipe all existing components
-        scm.Properties.$Components = buildComponentNodes(params.components, startUuid);
+      // Auto-detect component versions from existing SCM
+      const detectedVersions = extractVersionsFromScm(scm);
+      const mergedVersions = Object.assign({}, COMPONENT_VERSIONS, detectedVersions);
+
+      if (mode === 'replace') {
+        // Replace mode: backward compatible — clears all components
+        const startUuid = params.startUuid || (targetScreen === 'Screen1' ? 1 : 1000);
+        scm.Properties.$Components = buildComponentNodes(params.components, startUuid, mergedVersions);
       } else {
-        // Append mode (default): add new components alongside existing ones
-        if (!scm.Properties.$Components) scm.Properties.$Components = [];
-        const newNodes = buildComponentNodes(params.components, startUuid);
-        scm.Properties.$Components.push(...newNodes);
+        // Merge mode (default): preserve existing components, append new ones
+        const maxUuid = getMaxUuid(scm.Properties);
+        const newNodes = buildComponentNodes(params.components, maxUuid + 1, mergedVersions);
+
+        if (params.parent) {
+          // Add inside a specific parent component
+          const parentNode = findComponentByName(scm.Properties, params.parent);
+          if (!parentNode) {
+            return { success: false, error: 'Parent component not found: ' + params.parent };
+          }
+          parentNode.$Components = (parentNode.$Components || []).concat(newNodes);
+        } else {
+          // Add to screen root
+          scm.Properties.$Components = (scm.Properties.$Components || []).concat(newNodes);
+        }
       }
 
       rpcBody = capturedRpcTemplate.replace('___SCM_PLACEHOLDER___', JSON.stringify(scm));
@@ -518,7 +376,7 @@
           AppName: typeof BlocklyPanel_getProjectName === 'function' ? BlocklyPanel_getProjectName() : 'App',
           Title: targetScreen,
           Uuid: '0',
-          $Components: buildComponentNodes(params.components, startUuid)
+          $Components: buildComponentNodes(params.components, params.startUuid || (targetScreen === 'Screen1' ? 1 : 1000), null)
         }
       };
       const scmContent = '#\\!\n$JSON\n' + JSON.stringify(scm) + '\n\\!#';
@@ -585,12 +443,24 @@
       // Don't disable events — App Inventor needs them to trigger auto-save
       const newBlockIds = Blockly.Xml.domToWorkspace(xmlDom, ws);
 
-      // Check for warnings on new blocks
+      // Check for warnings and dropped connections on new blocks
       const warnings = [];
+      const droppedInputs = [];
       for (const id of newBlockIds) {
         const block = ws.getBlockById(id);
-        if (block && block.warning) {
+        if (!block) continue;
+        if (block.warning) {
           warnings.push(block.warning.getText());
+        }
+        // Detect inputs that have a socket but nothing connected
+        for (const input of block.inputList) {
+          if (input.connection && !input.connection.targetConnection && input.name) {
+            droppedInputs.push({
+              blockId: id,
+              blockType: block.type,
+              inputName: input.name
+            });
+          }
         }
       }
 
@@ -604,7 +474,8 @@
       return {
         success: true,
         blocksAdded: newBlockIds.length,
-        warnings
+        warnings,
+        droppedInputs: droppedInputs.length > 0 ? droppedInputs : undefined
       };
     } catch (err) {
       return { success: false, error: `Block injection error: ${err.message}` };
@@ -850,11 +721,45 @@
 
   // --- Helpers ---
 
+  function getMaxUuid(node) {
+    let max = 0;
+    if (node.Uuid) max = Math.max(max, parseInt(node.Uuid) || 0);
+    if (node.$Components) {
+      for (const child of node.$Components) {
+        max = Math.max(max, getMaxUuid(child));
+      }
+    }
+    if (node.Properties) max = Math.max(max, getMaxUuid(node.Properties));
+    return max;
+  }
+
+  function findComponentByName(node, name) {
+    if (node.$Name === name) return node;
+    const children = node.$Components || (node.Properties && node.Properties.$Components) || [];
+    for (const child of children) {
+      const found = findComponentByName(child, name);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  function extractVersionsFromScm(node) {
+    const versions = {};
+    if (node.$Type && node.$Version) versions[node.$Type] = node.$Version;
+    if (node.$Components) {
+      for (const child of node.$Components) {
+        Object.assign(versions, extractVersionsFromScm(child));
+      }
+    }
+    if (node.Properties) Object.assign(versions, extractVersionsFromScm(node.Properties));
+    return versions;
+  }
+
   const COMPONENT_VERSIONS = {
     // UI
-    Form: '31', Button: '7', Label: '5', TextBox: '6', PasswordTextBox: '5',
+    Form: '31', Button: '7', Label: '5', TextBox: '14', PasswordTextBox: '7',
     CheckBox: '3', Switch: '2', Slider: '2', Spinner: '2', ListPicker: '9',
-    DatePicker: '4', TimePicker: '4', Image: '5', ListView: '6', WebViewer: '10',
+    DatePicker: '4', TimePicker: '4', Image: '5', ListView: '10', WebViewer: '10',
     // Layout
     VerticalArrangement: '4', HorizontalArrangement: '4', TableArrangement: '2',
     // Media
@@ -872,20 +777,21 @@
     ContactPicker: '6', EmailPicker: '4', PhoneCall: '3', PhoneNumberPicker: '5',
     Sharing: '2', Texting: '5', Twitter: '5',
     // Storage
-    TinyDB: '2', File: '4', CloudDB: '2', FirebaseDB: '3', FusiontablesControl: '4',
+    TinyDB: '3', File: '4', CloudDB: '2', FirebaseDB: '3', FusiontablesControl: '4',
     // Connectivity
     Web: '7', ActivityStarter: '7', BluetoothClient: '8', BluetoothServer: '5',
     // Non-visible
     Notifier: '6'
   };
 
-  function buildComponentNodes(specs, nextUuid) {
+  function buildComponentNodes(specs, nextUuid, versions) {
+    const versionMap = versions || COMPONENT_VERSIONS;
     const nodes = [];
     for (const spec of specs) {
       const node = {
         $Name: spec.name,
         $Type: spec.type,
-        $Version: COMPONENT_VERSIONS[spec.type] || '1',
+        $Version: versionMap[spec.type] || COMPONENT_VERSIONS[spec.type] || '1',
         Uuid: String(nextUuid++)
       };
       if (spec.properties) {
@@ -894,7 +800,7 @@
         }
       }
       if (spec.children && spec.children.length > 0) {
-        node.$Components = buildComponentNodes(spec.children, nextUuid);
+        node.$Components = buildComponentNodes(spec.children, nextUuid, versionMap);
         nextUuid += countComponents(spec.children);
       }
       nodes.push(node);
