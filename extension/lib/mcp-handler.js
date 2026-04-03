@@ -59,11 +59,12 @@ export const TOOL_DEFINITIONS = [
   },
   {
     name: 'add_components',
-    description: 'Add components to the screen (batched save2 + reload)',
+    description: 'Add components to the screen. Appends by default. Set replaceAll=true to wipe existing components first.',
     inputSchema: {
       type: 'object',
       properties: {
         screenName: { type: 'string' },
+        replaceAll: { type: 'boolean', description: 'If true, replace all existing components instead of appending (default: false)' },
         components: {
           type: 'array',
           items: {

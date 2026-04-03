@@ -241,8 +241,7 @@ args:    /absolute/path/to/extension/host/index.js
 ## Usage
 
 1. Open a project at [ai2a.appinventor.mit.edu](https://ai2a.appinventor.mit.edu)
-2. Make one manual edit to prime session capture
-3. Start building:
+2. Start building — no manual edit needed. Claude automatically force-touches the component tree to establish the MCP connection:
 
 ```
 You: "Add a Button and Label to Screen1"
@@ -272,18 +271,13 @@ extension/
   manifest.json          # MV3 manifest
   background.js          # Service worker (WS bridge, auto-reconnect)
   content.js             # Content script (message relay, session cache)
-  page-bridge.js         # MAIN world script (GWT/Blockly access)
+  page-bridge.js         # MAIN world script (GWT/Blockly access + all tool handlers)
   host/
     index.js             # MCP server (stdio + WebSocket)
     install.sh           # Native messaging host installer
     package.json
   lib/
     mcp-handler.js       # MCP protocol parsing/routing
-    tool-handlers.js     # Tool implementations
-    scm-builder.js       # SCM JSON tree builder
-    gwt-rpc.js           # GWT-RPC request builder
-    bky-builder.js       # BKY XML generator
-    validators.js        # Input validation
 __tests__/               # 18 test files
 ```
 
@@ -296,14 +290,13 @@ TDD (Red -> Green -> Refactor). No production code without a failing test first.
 | Problem | Fix |
 |---------|-----|
 | `Chrome extension not connected` | Check service worker console for `Connected to host`. Verify host is running: `lsof -i :8765` |
-| `Session params not captured` | Make any manual edit in the designer to trigger a save2 intercept |
+| `Session params not captured` | Claude will force-touch the component tree automatically. If it still fails, try switching to Designer view |
 | `save2 failed with status 500` | Refresh App Inventor tab, make a manual edit to re-capture session params |
 | `Blockly workspace not available` | Switch to Blocks editor view |
 | `Extension request timed out` | Page may have reloaded mid-request -- retry |
 
 ## Known Limitations
 
-- Requires one manual edit after page load to capture session parameters
 - Page reloads after component changes (~3s) -- batch changes to minimize reloads
 - Screenshot tool not yet implemented
 - No official App Inventor API exists -- relies on reverse-engineered GWT-RPC and Blockly internals
