@@ -358,12 +358,12 @@
       }
 
       rpcBody = capturedRpcTemplate.replace('___SCM_PLACEHOLDER___', JSON.stringify(scm));
-      // Fix file path in RPC body if targeting a different screen
       if (capturedFilePath && capturedFilePath !== filePath) {
         rpcBody = rpcBody.replace(capturedFilePath, filePath);
       }
     } else {
       // From-scratch mode: build fresh SCM and RPC body
+      const startUuid = params.startUuid || (targetScreen === 'Screen1' ? 1 : 1000);
       const scm = {
         authURL: [window.location.hostname],
         YaVersion: '233',
@@ -401,7 +401,11 @@
       console.log('[MCP Bridge] save2 response:', xhr.status, xhr.responseText.substring(0, 300));
 
       if (xhr.status === 200) {
-        // Don't auto-reload — it kicks to project list. User can manually switch screens to refresh.
+        // Update cached SCM so subsequent calls see the new state
+        const scmMatch = rpcBody.match(/#\\!\n\$JSON\n([\s\S]*?)\n\\!#/);
+        if (scmMatch) {
+          try { capturedScmJson = JSON.parse(scmMatch[1]); } catch(e) {}
+        }
         return {
           success: true,
           componentsAdded: collectNames(params.components),
@@ -626,9 +630,37 @@
   }
 
   function handle_reload_designer() {
-    const start = Date.now();
-    location.reload();
-    return { success: true, loadTime: Date.now() - start };
+    // Instead of location.reload() which kills WebSocket + session state,
+    // try switching screens and back to force a designer refresh
+    try {
+      const currentScreen = typeof BlocklyPanel_getCurrentScreen === 'function'
+        ? BlocklyPanel_getCurrentScreen() : null;
+
+      if (currentScreen && typeof BlocklyPanel_switchScreen === 'function') {
+        // Try to find another screen to switch to and back
+        // This forces App Inventor to re-render the designer
+        BlocklyPanel_switchScreen(currentScreen);
+        return { success: true, method: 'screen_refresh', note: 'Designer refreshed via screen switch.' };
+      }
+
+      // Fallback: trigger a property toggle to force re-render
+      if (typeof BlocklyPanel_setComponentProperty === 'function') {
+        const screen = currentScreen || 'Screen1';
+        const title = typeof BlocklyPanel_getComponentInstancePropertyValue === 'function'
+          ? BlocklyPanel_getComponentInstancePropertyValue(screen, screen, 'Title') : screen;
+        BlocklyPanel_setComponentProperty(screen, screen, 'Title', title + ' ', 'Title');
+        setTimeout(() => {
+          BlocklyPanel_setComponentProperty(screen, screen, 'Title', title, 'Title');
+        }, 200);
+        return { success: true, method: 'property_toggle', note: 'Triggered re-render via property toggle.' };
+      }
+
+      // Last resort: full reload (warns user)
+      location.reload();
+      return { success: true, method: 'full_reload', note: 'Full page reload — session params will need re-capture.' };
+    } catch (err) {
+      return { success: false, error: `reload error: ${err.message}` };
+    }
   }
 
   function handle_clear_blocks(params) {
@@ -776,6 +808,17 @@
     return nodes;
   }
 
+  // Find the highest UUID in an SCM tree to avoid conflicts when appending
+  function getMaxUuid(node) {
+    let max = parseInt(node.Uuid || '0', 10) || 0;
+    if (node.$Components) {
+      for (const child of node.$Components) {
+        max = Math.max(max, getMaxUuid(child));
+      }
+    }
+    return max;
+  }
+
   function countComponents(specs) {
     let count = 0;
     for (const s of specs) {
@@ -795,37 +838,239 @@
   }
 
   function structuredToXml(block) {
+    // Handle next block chaining
+    const nextXml = block.next ? `<next>${structuredToXml(block.next)}</next>` : '';
+
     switch (block.type) {
+      // --- App Inventor Component Blocks ---
       case 'event_handler':
         return '<block type="component_event" x="50" y="50">' +
           `<mutation component_type="${block.componentType}" instance_name="${block.component}" event_name="${block.event}"></mutation>` +
           `<field name="COMPONENT_SELECTOR">${block.component}</field>` +
           (block.body ? '<statement name="DO">' + block.body.map(structuredToXml).join('') + '</statement>' : '') +
           '</block>';
+
       case 'set_property':
         return '<block type="component_set_get">' +
           `<mutation component_type="${block.componentType}" set_or_get="set" property_name="${block.property}" is_generic="false" instance_name="${block.component}"></mutation>` +
           `<field name="COMPONENT_SELECTOR">${block.component}</field>` +
           `<field name="PROP">${block.property}</field>` +
           (block.value ? `<value name="VALUE">${structuredToXml(block.value)}</value>` : '') +
+          nextXml + '</block>';
+
+      case 'get_property':
+        return '<block type="component_set_get">' +
+          `<mutation component_type="${block.componentType}" set_or_get="get" property_name="${block.property}" is_generic="false" instance_name="${block.component}"></mutation>` +
+          `<field name="COMPONENT_SELECTOR">${block.component}</field>` +
+          `<field name="PROP">${block.property}</field>` +
           '</block>';
-      case 'call_method':
+
+      case 'call_method': {
         let xml = '<block type="component_method">' +
           `<mutation component_type="${block.componentType}" method_name="${block.method}" instance_name="${block.component}" is_generic="false"></mutation>` +
           `<field name="COMPONENT_SELECTOR">${block.component}</field>`;
         if (block.args) {
           block.args.forEach((arg, i) => { xml += `<value name="ARG${i}">${structuredToXml(arg)}</value>`; });
         }
+        return xml + nextXml + '</block>';
+      }
+
+      // --- Variables ---
+      case 'global_declaration':
+        return '<block type="global_declaration" x="50" y="50">' +
+          `<field name="NAME">${block.name}</field>` +
+          (block.value ? `<value name="VALUE">${structuredToXml(block.value)}</value>` : '') +
+          '</block>';
+
+      case 'variable_get':
+        return `<block type="lexical_variable_get"><field name="VAR">${block.variable || block.name}</field></block>`;
+
+      case 'variable_set':
+        return '<block type="lexical_variable_set">' +
+          `<field name="VAR">${block.variable || block.name}</field>` +
+          (block.value ? `<value name="VALUE">${structuredToXml(block.value)}</value>` : '') +
+          nextXml + '</block>';
+
+      // --- Control Flow ---
+      case 'controls_if': {
+        const elseifCount = block.elseif ? block.elseif.length : 0;
+        const hasElse = !!block.else;
+        let xml = `<block type="controls_if"><mutation elseif="${elseifCount}" else="${hasElse ? 1 : 0}"></mutation>`;
+        // Primary if condition
+        if (block.condition) xml += `<value name="IF0">${structuredToXml(block.condition)}</value>`;
+        if (block.then) xml += `<statement name="DO0">${block.then.map(structuredToXml).join('')}</statement>`;
+        // Elseif branches
+        if (block.elseif) {
+          block.elseif.forEach((branch, i) => {
+            if (branch.condition) xml += `<value name="IF${i + 1}">${structuredToXml(branch.condition)}</value>`;
+            if (branch.then) xml += `<statement name="DO${i + 1}">${branch.then.map(structuredToXml).join('')}</statement>`;
+          });
+        }
+        // Else branch
+        if (block.else) xml += `<statement name="ELSE">${block.else.map(structuredToXml).join('')}</statement>`;
+        return xml + nextXml + '</block>';
+      }
+
+      case 'controls_forRange':
+        return '<block type="controls_forRange">' +
+          `<field name="VAR">${block.variable || 'i'}</field>` +
+          (block.from ? `<value name="START">${structuredToXml(block.from)}</value>` : '') +
+          (block.to ? `<value name="END">${structuredToXml(block.to)}</value>` : '') +
+          (block.by ? `<value name="STEP">${structuredToXml(block.by)}</value>` : '') +
+          (block.body ? `<statement name="DO">${block.body.map(structuredToXml).join('')}</statement>` : '') +
+          nextXml + '</block>';
+
+      case 'controls_forEach':
+        return '<block type="controls_forEach">' +
+          `<field name="VAR">${block.variable || 'item'}</field>` +
+          (block.list ? `<value name="LIST">${structuredToXml(block.list)}</value>` : '') +
+          (block.body ? `<statement name="DO">${block.body.map(structuredToXml).join('')}</statement>` : '') +
+          nextXml + '</block>';
+
+      case 'controls_while':
+        return '<block type="controls_while">' +
+          (block.condition ? `<value name="TEST">${structuredToXml(block.condition)}</value>` : '') +
+          (block.body ? `<statement name="DO">${block.body.map(structuredToXml).join('')}</statement>` : '') +
+          nextXml + '</block>';
+
+      // --- Logic ---
+      case 'logic_compare':
+        return '<block type="logic_compare">' +
+          `<field name="OP">${block.op || 'EQ'}</field>` +
+          (block.a ? `<value name="A">${structuredToXml(block.a)}</value>` : '') +
+          (block.b ? `<value name="B">${structuredToXml(block.b)}</value>` : '') +
+          '</block>';
+
+      case 'logic_operation':
+        return '<block type="logic_operation">' +
+          `<field name="OP">${block.op || 'AND'}</field>` +
+          (block.a ? `<value name="A">${structuredToXml(block.a)}</value>` : '') +
+          (block.b ? `<value name="B">${structuredToXml(block.b)}</value>` : '') +
+          '</block>';
+
+      case 'logic_negate':
+        return '<block type="logic_negate">' +
+          (block.value ? `<value name="BOOL">${structuredToXml(block.value)}</value>` : '') +
+          '</block>';
+
+      // --- Math ---
+      case 'math_arithmetic':
+        return '<block type="math_arithmetic">' +
+          `<field name="OP">${block.op || 'ADD'}</field>` +
+          (block.a ? `<value name="A">${structuredToXml(block.a)}</value>` : '') +
+          (block.b ? `<value name="B">${structuredToXml(block.b)}</value>` : '') +
+          '</block>';
+
+      case 'math_compare':
+        return '<block type="math_compare">' +
+          `<field name="OP">${block.op || 'EQ'}</field>` +
+          (block.a ? `<value name="A">${structuredToXml(block.a)}</value>` : '') +
+          (block.b ? `<value name="B">${structuredToXml(block.b)}</value>` : '') +
+          '</block>';
+
+      // --- Text ---
+      case 'text_join': {
+        const items = block.items || [];
+        let xml = `<block type="text_join"><mutation items="${items.length}"></mutation>`;
+        items.forEach((item, i) => { xml += `<value name="ADD${i}">${structuredToXml(item)}</value>`; });
         return xml + '</block>';
+      }
+
+      // --- Lists ---
+      case 'lists_create_with': {
+        const listItems = block.items || [];
+        let xml = `<block type="lists_create_with"><mutation items="${listItems.length}"></mutation>`;
+        listItems.forEach((item, i) => { xml += `<value name="ADD${i}">${structuredToXml(item)}</value>`; });
+        return xml + '</block>';
+      }
+
+      case 'lists_add_items':
+        return '<block type="lists_add_items">' +
+          (block.list ? `<value name="LIST">${structuredToXml(block.list)}</value>` : '') +
+          (block.item ? `<value name="ITEM">${structuredToXml(block.item)}</value>` : '') +
+          nextXml + '</block>';
+
+      // --- Procedures ---
+      case 'procedures_defnoreturn': {
+        let xml = '<block type="procedures_defnoreturn" x="50" y="50">' +
+          `<field name="NAME">${block.name}</field>`;
+        if (block.params && block.params.length > 0) {
+          xml += `<mutation><arg name="${block.params.join('"></arg><arg name="')}"></arg></mutation>`;
+        }
+        if (block.body) xml += `<statement name="STACK">${block.body.map(structuredToXml).join('')}</statement>`;
+        return xml + '</block>';
+      }
+
+      case 'procedures_defreturn': {
+        let xml = '<block type="procedures_defreturn" x="50" y="50">' +
+          `<field name="NAME">${block.name}</field>`;
+        if (block.params && block.params.length > 0) {
+          xml += `<mutation><arg name="${block.params.join('"></arg><arg name="')}"></arg></mutation>`;
+        }
+        if (block.body) xml += `<statement name="STACK">${block.body.map(structuredToXml).join('')}</statement>`;
+        if (block.returnValue) xml += `<value name="RETURN">${structuredToXml(block.returnValue)}</value>`;
+        return xml + '</block>';
+      }
+
+      case 'procedures_callnoreturn': {
+        let xml = '<block type="procedures_callnoreturn">' +
+          `<mutation name="${block.name}">`;
+        if (block.args) block.args.forEach(a => { xml += `<arg name="${a.name}"></arg>`; });
+        xml += '</mutation>';
+        if (block.args) block.args.forEach((a, i) => { xml += `<value name="ARG${i}">${structuredToXml(a.value)}</value>`; });
+        return xml + nextXml + '</block>';
+      }
+
+      case 'procedures_callreturn': {
+        let xml = '<block type="procedures_callreturn">' +
+          `<mutation name="${block.name}">`;
+        if (block.args) block.args.forEach(a => { xml += `<arg name="${a.name}"></arg>`; });
+        xml += '</mutation>';
+        if (block.args) block.args.forEach((a, i) => { xml += `<value name="ARG${i}">${structuredToXml(a.value)}</value>`; });
+        return xml + '</block>';
+      }
+
+      // --- Primitives ---
       case 'text':
-        return `<block type="text"><field name="TEXT">${block.value || ''}</field></block>`;
+        return `<block type="text"><field name="TEXT">${escapeXml(block.value || '')}</field></block>`;
       case 'number':
         return `<block type="math_number"><field name="NUM">${block.value || 0}</field></block>`;
       case 'boolean':
         return `<block type="logic_boolean"><field name="BOOL">${block.value ? 'TRUE' : 'FALSE'}</field></block>`;
+      case 'color':
+        return `<block type="color_make_color"><value name="COLORLIST">${structuredToXml(block.value)}</value></block>`;
+      case 'empty_string':
+        return '<block type="text"><field name="TEXT"></field></block>';
+
       default:
+        // Allow raw block type passthrough for anything not covered
+        if (block.rawType) {
+          let xml = `<block type="${block.rawType}">`;
+          if (block.fields) {
+            for (const [name, val] of Object.entries(block.fields)) {
+              xml += `<field name="${name}">${val}</field>`;
+            }
+          }
+          if (block.values) {
+            for (const [name, val] of Object.entries(block.values)) {
+              xml += `<value name="${name}">${structuredToXml(val)}</value>`;
+            }
+          }
+          if (block.statements) {
+            for (const [name, stmts] of Object.entries(block.statements)) {
+              xml += `<statement name="${name}">${stmts.map(structuredToXml).join('')}</statement>`;
+            }
+          }
+          return xml + nextXml + '</block>';
+        }
+        console.warn('[MCP Bridge] Unknown structured block type:', block.type);
         return '';
     }
+  }
+
+  // Escape XML special characters in text values
+  function escapeXml(str) {
+    return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
   }
 
   // --- Router ---
@@ -845,12 +1090,8 @@
     reload_designer: handle_reload_designer,
     undo: handle_undo,
     redo: handle_redo,
-    update_component_properties: (params) => {
-      return { success: false, error: 'update_component_properties requires reading current SCM first (use add_components with full tree)' };
-    },
-    remove_components: (params) => {
-      return { success: false, error: 'remove_components requires reading current SCM first (use add_components with full tree)' };
-    }
+    update_component_properties: handle_update_component_properties,
+    remove_components: handle_remove_components
   };
 
   // --- Message listener ---
@@ -906,6 +1147,32 @@
 
   // Request cached params from content script
   window.postMessage({ type: BRIDGE_PREFIX + 'cache-read' }, '*');
+
+  // Auto-capture session params on load if not cached
+  // Wait for App Inventor to fully load, then force a save2 to capture params
+  function autoCapture() {
+    if (capturedScmJson && capturedRpcTemplate) {
+      console.log('[MCP Bridge] Session params already available, skipping auto-capture');
+      return;
+    }
+    // Check if App Inventor is ready
+    if (typeof BlocklyPanel_setComponentProperty !== 'function') {
+      // Not ready yet, retry
+      console.log('[MCP Bridge] App Inventor not ready, retrying auto-capture in 3s...');
+      setTimeout(autoCapture, 3000);
+      return;
+    }
+    console.log('[MCP Bridge] Auto-capturing session params...');
+    forceSave2Capture().then((success) => {
+      if (success) {
+        console.log('[MCP Bridge] Auto-capture successful');
+      } else {
+        console.log('[MCP Bridge] Auto-capture failed, will capture on first tool call');
+      }
+    });
+  }
+  // Start auto-capture after a delay to let App Inventor initialize
+  setTimeout(autoCapture, 4000);
 
   // Expose tool dispatch globally so background can call via executeScript
   window.__mcpBridge = async function(tool, params) {
