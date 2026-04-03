@@ -59,11 +59,13 @@ export const TOOL_DEFINITIONS = [
   },
   {
     name: 'add_components',
-    description: 'Add components to the screen (batched save2 + reload)',
+    description: 'Add components to the screen. Default merge mode preserves existing components. Use parent param to nest inside a specific component.',
     inputSchema: {
       type: 'object',
       properties: {
         screenName: { type: 'string' },
+        mode: { type: 'string', enum: ['merge', 'replace'], description: 'merge (default) preserves existing components, replace wipes all' },
+        parent: { type: 'string', description: 'Parent component name to nest inside (e.g. "CustomerPanel")' },
         components: {
           type: 'array',
           items: {
