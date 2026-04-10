@@ -4,77 +4,104 @@
 const BRIDGE_PREFIX = 'appinventor-mcp-';
 const CACHE_KEY = 'mcpSessionParams';
 const pendingRequests = new Map();
+const TOOL_RESPONSE_MS = 25000;
 
-// --- Wake background service worker on load ---
-chrome.runtime.sendMessage({ type: 'wake' }).catch(() => {});
-
-// Listen for tool calls from background service worker
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message.type === 'ping') {
-    sendResponse({ pong: true });
-    return false;
+function injectPageBridge() {
+  const root = document.documentElement;
+  const loading = document.querySelector('script[data-aimcp-page-bridge]');
+  if (root?.hasAttribute('data-aimcp-page-bridge') || loading) {
+    return;
   }
-  if (message.type !== 'tool_call') return false;
+  const script = document.createElement('script');
+  script.dataset.aimcpPageBridge = '1';
+  script.src = chrome.runtime.getURL('page-bridge.js');
+  script.onload = () => script.remove();
+  (document.head || document.documentElement).appendChild(script);
+}
 
-  const { requestId, tool, params } = message;
+// Register once per frame: manifest + programmatic inject must not stack listeners or skip reinjection.
+if (!globalThis.__AIMCP_LISTENERS_ATTACHED) {
+  globalThis.__AIMCP_LISTENERS_ATTACHED = true;
 
-  // Forward to page-bridge.js via postMessage
-  window.postMessage({
-    type: `${BRIDGE_PREFIX}request`,
-    requestId,
-    tool,
-    params
-  }, '*');
+  chrome.runtime.sendMessage({ type: 'wake' }).catch(() => {});
 
-  // Store the response callback
-  pendingRequests.set(requestId, sendResponse);
-
-  // Return true to keep the message channel open for async response
-  return true;
-});
-
-// Listen for responses from page-bridge.js
-window.addEventListener('message', (event) => {
-  if (event.source !== window) return;
-  if (!event.data || !event.data.type) return;
-
-  const { type } = event.data;
-
-  // --- Tool call responses ---
-  if (type === `${BRIDGE_PREFIX}response`) {
-    const { requestId, result } = event.data;
-    const sendResponse = pendingRequests.get(requestId);
-    if (sendResponse) {
-      pendingRequests.delete(requestId);
-      sendResponse(result);
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message.type === 'ping') {
+      sendResponse({ pong: true });
+      return false;
     }
-    return;
-  }
+    if (message.type !== 'tool_call') return false;
 
-  // --- Cache write: page-bridge wants to persist session params ---
-  if (type === `${BRIDGE_PREFIX}cache-write`) {
-    chrome.storage.local.set({ [CACHE_KEY]: event.data.data }, () => {
-      console.log('[MCP Bridge] Session params cached');
+    const { requestId, tool, params } = message;
+
+    injectPageBridge();
+
+    window.postMessage(
+      {
+        type: `${BRIDGE_PREFIX}request`,
+        requestId,
+        tool,
+        params
+      },
+      '*'
+    );
+
+    const timeoutId = setTimeout(() => {
+      if (!pendingRequests.has(requestId)) return;
+      pendingRequests.delete(requestId);
+      sendResponse({
+        success: false,
+        error:
+          'Page bridge did not respond in time. The editor may still be loading; try again in a few seconds.'
+      });
+    }, TOOL_RESPONSE_MS);
+
+    pendingRequests.set(requestId, (result) => {
+      clearTimeout(timeoutId);
+      sendResponse(result);
     });
-    return;
-  }
 
-  // --- Cache read: page-bridge wants to load cached session params ---
-  if (type === `${BRIDGE_PREFIX}cache-read`) {
-    chrome.storage.local.get(CACHE_KEY, (result) => {
-      window.postMessage({
-        type: `${BRIDGE_PREFIX}cache-data`,
-        data: result[CACHE_KEY] || null
-      }, '*');
-    });
-    return;
-  }
-});
+    return true;
+  });
 
-// Inject page-bridge.js into the MAIN world so it can access App Inventor globals
-const script = document.createElement('script');
-script.src = chrome.runtime.getURL('page-bridge.js');
-script.onload = () => script.remove();
-(document.head || document.documentElement).appendChild(script);
+  window.addEventListener('message', (event) => {
+    // Same-window bridge traffic; do not require event.source === window (isolated vs main world).
+    if (!event.data || typeof event.data.type !== 'string') return;
+    if (!event.data.type.startsWith(BRIDGE_PREFIX)) return;
 
+    const { type } = event.data;
+
+    if (type === `${BRIDGE_PREFIX}response`) {
+      const { requestId, result } = event.data;
+      const finish = pendingRequests.get(requestId);
+      if (finish) {
+        pendingRequests.delete(requestId);
+        finish(result);
+      }
+      return;
+    }
+
+    if (type === `${BRIDGE_PREFIX}cache-write`) {
+      chrome.storage.local.set({ [CACHE_KEY]: event.data.data }, () => {
+        console.log('[MCP Bridge] Session params cached');
+      });
+      return;
+    }
+
+    if (type === `${BRIDGE_PREFIX}cache-read`) {
+      chrome.storage.local.get(CACHE_KEY, (result) => {
+        window.postMessage(
+          {
+            type: `${BRIDGE_PREFIX}cache-data`,
+            data: result[CACHE_KEY] || null
+          },
+          '*'
+        );
+      });
+      return;
+    }
+  });
+}
+
+injectPageBridge();
 console.log('[MCP Bridge] Content script loaded');

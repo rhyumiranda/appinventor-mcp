@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "MIT App Inventor MCP Bridge",
-  "version": "0.1.0",
+  "version": "0.1.4",
   "description": "Exposes MIT App Inventor as an MCP server for AI agents",
   "permissions": [
     "nativeMessaging",
