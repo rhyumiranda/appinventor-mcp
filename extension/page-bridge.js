@@ -4,6 +4,11 @@
 (function() {
   'use strict';
 
+  // Marker on the document so the content script can detect an existing bridge (script tag is removed after load).
+  if (typeof document !== 'undefined' && document.documentElement) {
+    document.documentElement.setAttribute('data-aimcp-page-bridge', '1');
+  }
+
   const BRIDGE_PREFIX = 'appinventor-mcp-';
 
   // --- Session parameter capture ---
@@ -719,6 +724,139 @@
     }
   }
 
+  function removeFromScmTree(node, names) {
+    if (!node.$Components) return;
+    node.$Components = node.$Components.filter((c) => !names.includes(c.$Name));
+    for (const child of node.$Components) {
+      removeFromScmTree(child, names);
+    }
+  }
+
+  async function saveScmViaRpc(scm, targetScreen) {
+    const permHash = extractGwtPermutation();
+    if (!permHash) {
+      return { success: false, error: 'Could not extract GWT permutation hash from page scripts' };
+    }
+    if (!capturedRpcTemplate) {
+      const got = await getCurrentScm();
+      if (!got || !capturedRpcTemplate) {
+        return {
+          success: false,
+          error: 'No save template. Open the Designer, wait for auto-save, then retry.'
+        };
+      }
+    }
+    let filePath = capturedFilePath;
+    if (filePath) {
+      filePath = filePath.replace(/\/[^/]+\.scm$/, '/' + targetScreen + '.scm');
+    } else {
+      const projectName =
+        typeof BlocklyPanel_getProjectName === 'function' ? BlocklyPanel_getProjectName() : null;
+      if (!projectName) {
+        return { success: false, error: 'Could not determine file path' };
+      }
+      const bodyText = document.body.innerHTML;
+      const m = bodyText.match(/src\/appinventor\/(ai_[^/]+)\//);
+      if (m) {
+        filePath = 'src/appinventor/' + m[1] + '/' + projectName + '/' + targetScreen + '.scm';
+      } else {
+        return { success: false, error: 'Could not determine file path' };
+      }
+    }
+    const scmJsonStr = JSON.stringify(scm);
+    let rpcBody = capturedRpcTemplate.replace('___SCM_PLACEHOLDER___', scmJsonStr);
+    if (capturedFilePath && capturedFilePath !== filePath) {
+      rpcBody = rpcBody.replace(capturedFilePath, filePath);
+    }
+    try {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', window.location.origin + '/ode/projects', false);
+      xhr.setRequestHeader('Content-Type', 'text/x-gwt-rpc; charset=UTF-8');
+      xhr.setRequestHeader('X-GWT-Module-Base', window.location.origin + '/ode/');
+      if (permHash) xhr.setRequestHeader('X-GWT-Permutation', permHash);
+      xhr.send(rpcBody);
+      if (xhr.status === 200) {
+        const scmMatch = rpcBody.match(/#\\!\n\$JSON\n([\s\S]*?)\n\\!#/);
+        if (scmMatch) {
+          try {
+            capturedScmJson = JSON.parse(scmMatch[1]);
+          } catch (e) {
+            /* keep previous */
+          }
+        }
+        return { success: true };
+      }
+      return {
+        success: false,
+        error: `save2 failed with status ${xhr.status}: ${xhr.responseText.substring(0, 200)}`
+      };
+    } catch (err) {
+      return { success: false, error: `save2 error: ${err.message}` };
+    }
+  }
+
+  async function handle_update_component_properties(params) {
+    try {
+      const screenName = params.screenName || 'Screen1';
+      if (!params.componentName) {
+        return { success: false, error: 'componentName is required' };
+      }
+      if (!params.properties || typeof params.properties !== 'object') {
+        return { success: false, error: 'properties object is required' };
+      }
+      if (!capturedScmJson || !capturedRpcTemplate) {
+        const got = await getCurrentScm();
+        if (!got || !capturedScmJson) {
+          return {
+            success: false,
+            error: 'Could not read component tree. Open the Designer and try again.'
+          };
+        }
+      }
+      const scm = JSON.parse(JSON.stringify(capturedScmJson));
+      const comp = findComponentByName(scm.Properties, params.componentName);
+      if (!comp) {
+        return { success: false, error: `Component "${params.componentName}" not found` };
+      }
+      const updated = [];
+      for (const [k, v] of Object.entries(params.properties)) {
+        comp[k] = String(v);
+        updated.push(k);
+      }
+      const out = await saveScmViaRpc(scm, screenName);
+      if (!out.success) return out;
+      return { success: true, updatedProperties: updated };
+    } catch (err) {
+      return { success: false, error: `Failed to update properties: ${err.message}` };
+    }
+  }
+
+  async function handle_remove_components(params) {
+    try {
+      const screenName = params.screenName || 'Screen1';
+      const names = params.componentNames;
+      if (!Array.isArray(names) || names.length === 0) {
+        return { success: false, error: 'componentNames (non-empty array) is required' };
+      }
+      if (!capturedScmJson || !capturedRpcTemplate) {
+        const got = await getCurrentScm();
+        if (!got || !capturedScmJson) {
+          return {
+            success: false,
+            error: 'Could not read component tree. Open the Designer and try again.'
+          };
+        }
+      }
+      const scm = JSON.parse(JSON.stringify(capturedScmJson));
+      removeFromScmTree(scm.Properties, names);
+      const out = await saveScmViaRpc(scm, screenName);
+      if (!out.success) return out;
+      return { success: true, removedComponents: names };
+    } catch (err) {
+      return { success: false, error: `Failed to remove components: ${err.message}` };
+    }
+  }
+
   // --- Helpers ---
 
   function getMaxUuid(node) {
@@ -1095,8 +1233,8 @@
   };
 
   // --- Message listener ---
+  // Do not filter on event.source: content-script isolated world postMessage can fail event.source === window.
   window.addEventListener('message', (event) => {
-    if (event.source !== window) return;
     if (!event.data || event.data.type !== `${BRIDGE_PREFIX}request`) return;
 
     const { requestId, tool, params } = event.data;
@@ -1122,7 +1260,6 @@
 
   // --- Cache-first: load cached session params on startup ---
   window.addEventListener('message', function cacheListener(event) {
-    if (event.source !== window) return;
     if (!event.data || event.data.type !== BRIDGE_PREFIX + 'cache-data') return;
 
     const data = event.data.data;
